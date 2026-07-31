@@ -23,7 +23,7 @@ On Ubuntu these tools are normally already installed.
 ```sh
 git clone https://github.com/Extraden/termrec.git
 cd termrec
-./install.sh
+bash install.sh
 ```
 
 Make sure `~/.local/bin` is in `PATH`:
