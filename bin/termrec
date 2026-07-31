@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+
+set -u
+
+readonly TERMREC_VERSION="0.1.0"
+readonly TERMREC_HOME="${TERMREC_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/termrec}"
+readonly SESSIONS_DIR="$TERMREC_HOME/sessions"
+readonly ARCHIVES_DIR="$TERMREC_HOME/archives"
+
+error() {
+    printf 'termrec: %s\n' "$*" >&2
+}
+
+die() {
+    error "$@"
+    exit 1
+}
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  termrec                              Record a login shell
+  termrec COMMAND [ARG ...]            Record one command
+  termrec start [OPTIONS] [-- COMMAND [ARG ...]]
+  termrec list
+  termrec replay [SESSION] [OPTIONS]
+  termrec summary [SESSION]
+  termrec pack [SESSION]
+  termrec path [SESSION]
+  termrec doctor
+
+Start options:
+  -n, --name NAME                      Add a readable label to the session
+
+Replay options:
+  -s, --speed NUMBER                   Playback speed multiplier (default: 1)
+  -m, --max-delay SECONDS              Maximum pause between events (default: 2)
+
+SESSION may be a session ID, a session directory, or "latest".
+
+Examples:
+  termrec
+  termrec --name exam -- vim --clean bigint.cpp
+  termrec nvim --clean bigint.cpp
+  termrec replay latest --speed 2
+  termrec pack latest
+USAGE
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+sanitize_label() {
+    local label=$1
+    label=$(printf '%s' "$label" | tr '[:space:]' '-' | sed 's/[^A-Za-z0-9._-]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//')
+    printf '%.60s' "$label"
+}
+
+latest_session() {
+    local dirs=()
+    local latest
+    local dir
+
+    shopt -s nullglob
+    dirs=("$SESSIONS_DIR"/*)
+    shopt -u nullglob
+
+    ((${#dirs[@]} > 0)) || return 1
+
+    latest=${dirs[0]}
+    for dir in "${dirs[@]:1}"; do
+        [[ $dir -nt $latest ]] && latest=$dir
+    done
+
+    printf '%s\n' "$latest"
+}
+
+resolve_session() {
+    local requested=${1:-latest}
+    local resolved
+
+    if [[ $requested == latest ]]; then
+        resolved=$(latest_session) || die "no recordings found in $SESSIONS_DIR"
+    elif [[ -d $requested ]]; then
+        resolved=$requested
+    elif [[ -d $SESSIONS_DIR/$requested ]]; then
+        resolved=$SESSIONS_DIR/$requested
+    else
+        die "session not found: $requested"
+    fi
+
+    printf '%s\n' "$resolved"
+}
+
+write_command_line() {
+    local arg
+    printf 'command='
+    for arg in "$@"; do
+        printf '%q ' "$arg"
+    done
+    printf '\n'
+}
+
+capture_git_state() {
+    local session_dir=$1
+    local phase=$2
+    local git_dir="$session_dir/git"
+    local root
+
+    command -v git >/dev/null 2>&1 || return 0
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+
+    mkdir -p "$git_dir"
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+
+    printf '%s\n' "$root" > "$git_dir/root.txt"
+    git -C "$root" rev-parse HEAD > "$git_dir/head-$phase.txt" 2>/dev/null || true
+    git -C "$root" status --short --branch > "$git_dir/status-$phase.txt" 2>/dev/null || true
+    git -C "$root" diff --binary > "$git_dir/diff-$phase.patch" 2>/dev/null || true
+    git -C "$root" diff --cached --binary > "$git_dir/staged-$phase.patch" 2>/dev/null || true
+}
+
+make_launcher() {
+    local launcher=$1
+    shift
+    local -a recorded_command=("$@")
+
+    {
+        printf '#!/usr/bin/env bash\n'
+        declare -p recorded_command
+        printf 'exec "${recorded_command[@]}"\n'
+    } > "$launcher"
+
+    chmod 700 "$launcher"
+}
+
+start_recording() {
+    local label=""
+    local session_id
+    local session_dir
+    local timestamp
+    local launcher
+    local rc
+    local -a recorded_command=()
+
+    while (($# > 0)); do
+        case $1 in
+            -n|--name)
+                (($# >= 2)) || die "$1 requires a value"
+                label=$2
+                shift 2
+                ;;
+            --name=*)
+                label=${1#*=}
+                shift
+                ;;
+            --)
+                shift
+                recorded_command=("$@")
+                break
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            *)
+                recorded_command=("$@")
+                break
+                ;;
+        esac
+    done
+
+    if ((${#recorded_command[@]} == 0)); then
+        recorded_command=("${SHELL:-/bin/sh}" -l)
+    fi
+
+    need_command script
+    need_command "${recorded_command[0]}"
+
+    umask 077
+    mkdir -p "$SESSIONS_DIR"
+
+    timestamp=$(date +'%Y-%m-%d_%H-%M-%S')
+    session_id=$timestamp
+    if [[ -n $label ]]; then
+        label=$(sanitize_label "$label")
+        [[ -n $label ]] && session_id+="_$label"
+    fi
+    session_id+="_$$"
+    session_dir="$SESSIONS_DIR/$session_id"
+    mkdir -p "$session_dir"
+
+    {
+        printf 'format=termrec-v1\n'
+        printf 'termrec_version=%s\n' "$TERMREC_VERSION"
+        printf 'session_id=%s\n' "$session_id"
+        printf 'started_at=%s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
+        printf 'working_directory=%s\n' "$PWD"
+        printf 'shell=%s\n' "${SHELL:-unknown}"
+        printf 'term=%s\n' "${TERM:-unknown}"
+        printf 'terminal_size=%s\n' "$(stty size 2>/dev/null || printf 'unknown')"
+        printf 'hostname=%s\n' "$(hostname 2>/dev/null || printf 'unknown')"
+        write_command_line "${recorded_command[@]}"
+        script --version 2>/dev/null || true
+    } > "$session_dir/meta.txt"
+
+    capture_git_state "$session_dir" before
+
+    launcher=$(mktemp "${TMPDIR:-/tmp}/termrec-launcher.XXXXXX") || die "could not create launcher"
+    make_launcher "$launcher" "${recorded_command[@]}"
+
+    printf 'Recording: %s\n' "$session_id"
+    printf 'Directory: %s\n' "$session_dir"
+    printf 'Command: '
+    printf '%q ' "${recorded_command[@]}"
+    printf '\nStop by exiting the recorded program or shell.\n\n'
+
+    script \
+        --quiet \
+        --return \
+        --logging-format advanced \
+        --log-in "$session_dir/input.log" \
+        --log-out "$session_dir/output.log" \
+        --log-timing "$session_dir/timing.log" \
+        --command "$launcher"
+    rc=$?
+
+    rm -f "$launcher"
+
+    capture_git_state "$session_dir" after
+
+    {
+        printf 'finished_at=%s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
+        printf 'exit_status=%d\n' "$rc"
+    } >> "$session_dir/meta.txt"
+
+    printf '\nRecording saved: %s\n' "$session_dir"
+    du -sh "$session_dir" 2>/dev/null || true
+
+    return "$rc"
+}
+
+list_sessions() {
+    local dirs=()
+    local dir
+    local size
+
+    mkdir -p "$SESSIONS_DIR"
+    shopt -s nullglob
+    dirs=("$SESSIONS_DIR"/*)
+    shopt -u nullglob
+
+    if ((${#dirs[@]} == 0)); then
+        printf 'No recordings in %s\n' "$SESSIONS_DIR"
+        return 0
+    fi
+
+    printf '%-46s %8s\n' 'SESSION' 'SIZE'
+    for dir in "${dirs[@]}"; do
+        size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+        printf '%-46s %8s\n' "$(basename "$dir")" "${size:-?}"
+    done | sort -r
+}
+
+replay_session() {
+    local requested=latest
+    local speed=1
+    local max_delay=2
+    local session_dir
+
+    if (($# > 0)) && [[ $1 != -* ]]; then
+        requested=$1
+        shift
+    fi
+
+    while (($# > 0)); do
+        case $1 in
+            -s|--speed)
+                (($# >= 2)) || die "$1 requires a value"
+                speed=$2
+                shift 2
+                ;;
+            --speed=*)
+                speed=${1#*=}
+                shift
+                ;;
+            -m|--max-delay)
+                (($# >= 2)) || die "$1 requires a value"
+                max_delay=$2
+                shift 2
+                ;;
+            --max-delay=*)
+                max_delay=${1#*=}
+                shift
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            *)
+                die "unknown replay option: $1"
+                ;;
+        esac
+    done
+
+    need_command scriptreplay
+    session_dir=$(resolve_session "$requested")
+
+    scriptreplay \
+        --log-timing "$session_dir/timing.log" \
+        --log-out "$session_dir/output.log" \
+        --divisor "$speed" \
+        --maxdelay "$max_delay"
+}
+
+summary_session() {
+    local session_dir
+    session_dir=$(resolve_session "${1:-latest}")
+    need_command scriptreplay
+
+    scriptreplay \
+        --summary \
+        --log-timing "$session_dir/timing.log" \
+        --log-in "$session_dir/input.log" \
+        --log-out "$session_dir/output.log"
+}
+
+pack_session() {
+    local session_dir
+    local archive
+    local base
+
+    need_command tar
+    session_dir=$(resolve_session "${1:-latest}")
+    mkdir -p "$ARCHIVES_DIR"
+
+    base=$(basename "$session_dir")
+    archive="$ARCHIVES_DIR/$base.tar.gz"
+    tar -czf "$archive" -C "$(dirname "$session_dir")" "$base"
+
+    printf '%s\n' "$archive"
+    du -sh "$archive" 2>/dev/null || true
+}
+
+show_path() {
+    resolve_session "${1:-latest}"
+}
+
+doctor() {
+    local failed=0
+    local cmd
+
+    printf 'termrec %s\n' "$TERMREC_VERSION"
+    printf 'storage: %s\n' "$TERMREC_HOME"
+
+    for cmd in bash script scriptreplay tar; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            printf '[ok]      %-12s %s\n' "$cmd" "$(command -v "$cmd")"
+        else
+            printf '[missing] %s\n' "$cmd"
+            failed=1
+        fi
+    done
+
+    if command -v script >/dev/null 2>&1; then
+        script --version 2>/dev/null || true
+    fi
+
+    return "$failed"
+}
+
+main() {
+    local action=${1:-start}
+
+    case $action in
+        start)
+            (($# > 0)) && shift
+            start_recording "$@"
+            ;;
+        list|ls)
+            list_sessions
+            ;;
+        replay|play)
+            shift
+            replay_session "$@"
+            ;;
+        summary|info)
+            shift
+            summary_session "$@"
+            ;;
+        pack|archive)
+            shift
+            pack_session "$@"
+            ;;
+        path)
+            shift
+            show_path "$@"
+            ;;
+        doctor)
+            doctor
+            ;;
+        version|--version|-V)
+            printf 'termrec %s\n' "$TERMREC_VERSION"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        --name|-n|--)
+            start_recording "$@"
+            ;;
+        *)
+            start_recording "$@"
+            ;;
+    esac
+}
+
+main "$@"
